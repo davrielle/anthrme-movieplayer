@@ -20,7 +20,7 @@ A lightweight desktop video player built with Python, powered by mpv, with live 
 
 ## Download (Windows)
 
-Grab the latest build from the [Releases](../../releases) page, extract the zip, and run `anthrme-MOVIEPLAYER.exe`.
+Grab the latest build from the [Releases](../../releases) page. Extract the whole zip, keep all files together, and run `anthrme-MOVIEPLAYER.exe` from inside the folder.
 Discord desktop must be open for Rich Presence to work.
 
 ## Run from source
