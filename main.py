@@ -1,11 +1,12 @@
 import json
 import os
+import re
 import sys
 import time
 import locale
 
 if getattr(sys, "frozen", False):
-    BASE_DIR = sys._MEIPASS 
+    BASE_DIR = sys._MEIPASS
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ["PATH"] = BASE_DIR + os.pathsep + os.environ["PATH"]
@@ -13,26 +14,35 @@ os.environ["PATH"] = BASE_DIR + os.pathsep + os.environ["PATH"]
 import mpv
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QVBoxLayout, QHBoxLayout,
-    QPushButton, QFileDialog, QSlider, QLabel, QListWidget,
+    QPushButton, QFileDialog, QSlider, QLabel, QListWidget, QMenu, QMessageBox,
 )
 
 from discord_rpc import DiscordRPC
 
+"== Konstanta =="
 APP_TITLE = "anthrme-MOVIEPLAYER"
-VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v")
-FILE_FILTER = "Video (*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv *.m4v);;Semua file (*.*)"
+VIDEO_EXT = (
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v",
+    ".ts", ".mts", ".m2ts", ".mpg", ".mpeg", ".3gp", ".ogv",
+)
+FILE_FILTER = "Video (" + " ".join("*" + e for e in VIDEO_EXT) + ");;Semua file (*.*)"
 DATA_DIR = os.path.join(os.environ.get("APPDATA", BASE_DIR), "anthrme-MOVIEPLAYER")
 os.makedirs(DATA_DIR, exist_ok=True)
 RESUME_FILE = os.path.join(DATA_DIR, "resume.json")
 ICON_PATH = os.path.join(BASE_DIR, "icon.ico")
+SHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "anthrme-MOVIEPLAYER")
+SERVER_NAME = "anthrme-movieplayer-instance"
 
-SKIP_SECONDS = 5          # lompat maju/mundur berapa detik
-BAR_HIDE_DELAY = 3        # detik: bar fullscreen ngilang kalau mouse diem
+SKIP_SECONDS = 5
+BAR_HIDE_DELAY = 3
+SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
-ACCENT = "#7FDB5A"   # hijau logo lu, ganti kode warna ini buat ngubah aksen
+ACCENT = "#7FDB5A"
 
+"== Tema =="
 THEME = f"""
 QMainWindow, QWidget {{
     background-color: #0f1115;
@@ -50,6 +60,7 @@ QPushButton {{
 }}
 QPushButton:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
 QPushButton:pressed {{ background-color: {ACCENT}; color: #0f1115; }}
+QPushButton::menu-indicator {{ image: none; width: 0px; }}
 
 QPushButton#primary {{
     background-color: {ACCENT};
@@ -90,6 +101,23 @@ QScrollBar::handle:vertical {{
 QScrollBar::handle:vertical:hover {{ background: {ACCENT}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 
+QMenu {{
+    background-color: #151820;
+    border: 1px solid #2a2f3a;
+    border-radius: 8px;
+    padding: 6px;
+}}
+QMenu::item {{ padding: 7px 26px; border-radius: 5px; }}
+QMenu::item:selected {{ background-color: {ACCENT}; color: #0f1115; }}
+QMenu::separator {{ height: 1px; background: #2a2f3a; margin: 6px 4px; }}
+
+QToolTip {{
+    background-color: #151820;
+    color: #e6e6e6;
+    border: 1px solid #2a2f3a;
+    padding: 4px 8px;
+}}
+
 QFrame#fsbar {{
     background-color: #0f1115;
     border: 1px solid #2a2f3a;
@@ -98,55 +126,173 @@ QFrame#fsbar {{
 """
 
 
+"== Fungsi bantu =="
 def format_time(seconds):
-    """Ubah detik jadi format mm:ss atau hh:mm:ss."""
     seconds = int(seconds or 0)
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def track_label(track):
+    parts = []
+    lang = track.get("lang")
+    if lang:
+        parts.append(str(lang).upper())
+    title = track.get("title")
+    if title:
+        parts.append(str(title))
+    codec = track.get("codec")
+    if codec:
+        parts.append(str(codec))
+    text = " · ".join(parts) if parts else "Track"
+    return f"{track.get('id')}. {text}"
+
+
+"== Registrasi Open with di Windows =="
+def registry_delete_tree(root, path):
+    import winreg
+    try:
+        with winreg.OpenKey(root, path, 0, winreg.KEY_ALL_ACCESS) as key:
+            while True:
+                try:
+                    sub = winreg.EnumKey(key, 0)
+                except OSError:
+                    break
+                registry_delete_tree(root, path + "\\" + sub)
+        winreg.DeleteKey(root, path)
+    except FileNotFoundError:
+        pass
+
+
+def registry_register(exe_path):
+    import ctypes
+    import winreg
+    app_key = "Software\\Classes\\Applications\\" + os.path.basename(exe_path)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_key) as key:
+        winreg.SetValueEx(key, "FriendlyAppName", 0, winreg.REG_SZ, APP_TITLE)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_key + "\\DefaultIcon") as key:
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, f'"{exe_path}",0')
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_key + "\\shell\\open\\command") as key:
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, f'"{exe_path}" "%1"')
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_key + "\\SupportedTypes") as key:
+        for ext in VIDEO_EXT:
+            winreg.SetValueEx(key, ext, 0, winreg.REG_SZ, "")
+    ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+
+
+def registry_unregister(exe_path):
+    import ctypes
+    import winreg
+    app_key = "Software\\Classes\\Applications\\" + os.path.basename(exe_path)
+    registry_delete_tree(winreg.HKEY_CURRENT_USER, app_key)
+    ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+
+
+"== Satu instance: kirim file ke app yang sudah jalan =="
+def forward_to_running_instance(paths):
+    socket = QLocalSocket()
+    socket.connectToServer(SERVER_NAME)
+    if not socket.waitForConnected(300):
+        return False
+    socket.write("\n".join(paths).encode("utf-8"))
+    socket.flush()
+    socket.waitForBytesWritten(1000)
+    socket.disconnectFromServer()
+    return True
+
+
+"== Notifikasi kecil =="
+class Toast(QLabel):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            "QLabel { background-color: rgba(15, 17, 21, 235); color: white;"
+            " border: 1px solid #2a2f3a; border-radius: 10px;"
+            " padding: 10px 22px; font-size: 14px; }"
+        )
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.hide)
+
+    def popup(self, text, area):
+        self.setText(text)
+        self.adjustSize()
+        x = area.left() + (area.width() - self.width()) // 2
+        y = area.top() + 40
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.hide_timer.start(1800)
+
+
 class Player(QMainWindow):
-    # Signal dipakai karena tombol mpv dipanggil dari thread lain,
-    # sedangkan UI Qt cuma boleh diubah dari thread utama
     fullscreen_toggled = Signal()
     fullscreen_exited = Signal()
+    speed_up_req = Signal()
+    speed_down_req = Signal()
+    shot_req = Signal()
 
-    def __init__(self):
+    def __init__(self, server=None):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(QIcon(ICON_PATH))
-        self.resize(1200, 640)
+        self.resize(1320, 720)
         self.setAcceptDrops(True)
 
-        # ---------- State ----------
-        self.playlist = []          # daftar path video
-        self.index = -1             # urutan video yang lagi diputar
+        "== State =="
+        self.server = server
+        self.playlist = []
+        self.index = -1
         self.current_path = None
         self.current_title = None
-        self.was_playing = False    # dipakai buat deteksi video selesai
+        self.was_playing = False
         self.last_save = 0
+        self.last_remote = 0
+        self.speed_index = SPEEDS.index(1.0)
         self.panel_visible = True
         self.last_cursor_pos = QCursor.pos()
         self.last_cursor_move = 0
         self.resume = self.load_resume()
+        self.toast = Toast()
 
-        # ---------- Area video ----------
+        "== Area video =="
         self.video = QWidget()
         self.video.setAttribute(Qt.WA_NativeWindow)
         self.video.setStyleSheet("background-color: black;")
 
-        # ---------- Tombol kontrol (mode biasa) ----------
+        "== Tombol kontrol =="
         self.btn_open = QPushButton("Open")
         self.btn_prev = QPushButton("⏮")
         self.btn_back = QPushButton(f"« {SKIP_SECONDS}s")
         self.btn_play = QPushButton("▶")
         self.btn_fwd = QPushButton(f"{SKIP_SECONDS}s »")
         self.btn_next = QPushButton("⏭")
-        self.btn_list = QPushButton("Playlist")
-        self.btn_full = QPushButton("⛶ Fullscreen")
+        self.btn_speed = QPushButton("1x")
+        self.btn_audio = QPushButton("Audio")
+        self.btn_sub = QPushButton("Sub")
+        self.btn_shot = QPushButton("📷")
+        self.btn_more = QPushButton("⋯")
+        self.btn_list = QPushButton("☰")
+        self.btn_full = QPushButton("⛶")
 
         self.btn_play.setObjectName("primary")
+        self.btn_speed.setToolTip("Kecepatan putar ( [ dan ] )")
+        self.btn_audio.setToolTip("Pilih audio track")
+        self.btn_sub.setToolTip("Pilih subtitle")
+        self.btn_shot.setToolTip("Screenshot (S)")
+        self.btn_more.setToolTip("Menu lainnya")
+        self.btn_list.setToolTip("Tampilkan / sembunyikan playlist")
+        self.btn_full.setToolTip("Fullscreen (F)")
 
         self.btn_open.clicked.connect(self.open_files)
         self.btn_prev.clicked.connect(self.play_prev)
@@ -154,42 +300,68 @@ class Player(QMainWindow):
         self.btn_play.clicked.connect(self.toggle_pause)
         self.btn_fwd.clicked.connect(lambda: self.skip(SKIP_SECONDS))
         self.btn_next.clicked.connect(self.play_next)
+        self.btn_speed.clicked.connect(self.cycle_speed)
+        self.btn_shot.clicked.connect(self.take_screenshot)
         self.btn_list.clicked.connect(self.toggle_panel)
         self.btn_full.clicked.connect(self.toggle_fullscreen)
 
-        # Seek bar + waktu
+        "== Menu audio, subtitle, lainnya =="
+        self.audio_menu = QMenu(self)
+        self.audio_menu.aboutToShow.connect(self.fill_audio_menu)
+        self.btn_audio.setMenu(self.audio_menu)
+
+        self.sub_menu = QMenu(self)
+        self.sub_menu.aboutToShow.connect(self.fill_sub_menu)
+        self.btn_sub.setMenu(self.sub_menu)
+
+        self.more_menu = QMenu(self)
+        register_action = self.more_menu.addAction("Daftarkan ke menu 'Open with' Windows")
+        register_action.triggered.connect(self.register_open_with)
+        unregister_action = self.more_menu.addAction("Hapus dari menu 'Open with'")
+        unregister_action.triggered.connect(self.unregister_open_with)
+        self.more_menu.addSeparator()
+        folder_action = self.more_menu.addAction("Buka folder screenshot")
+        folder_action.triggered.connect(self.open_shot_folder)
+        self.btn_more.setMenu(self.more_menu)
+
+        "== Seek bar, waktu, volume =="
         self.seek = QSlider(Qt.Horizontal)
         self.seek.setRange(0, 1000)
         self.seek.sliderReleased.connect(lambda: self.on_seek(self.seek))
         self.time_label = QLabel("00:00 / 00:00")
 
-        # Volume
         self.volume = QSlider(Qt.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
         self.volume.setFixedWidth(110)
         self.volume.valueChanged.connect(self.on_volume)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(8)
-        controls.setContentsMargins(0, 0, 0, 0)
-        controls.addWidget(self.btn_open)
-        controls.addWidget(self.btn_prev)
-        controls.addWidget(self.btn_back)
-        controls.addWidget(self.btn_play)
-        controls.addWidget(self.btn_fwd)
-        controls.addWidget(self.btn_next)
-        controls.addWidget(self.seek, stretch=1)
-        controls.addWidget(self.time_label)
-        controls.addWidget(QLabel("Vol"))
-        controls.addWidget(self.volume)
-        controls.addWidget(self.btn_list)
-        controls.addWidget(self.btn_full)
+        "== Susunan bar kontrol (2 baris) =="
+        seek_row = QHBoxLayout()
+        seek_row.setSpacing(10)
+        seek_row.addWidget(self.seek, stretch=1)
+        seek_row.addWidget(self.time_label)
+
+        buttons_row = QHBoxLayout()
+        buttons_row.setSpacing(8)
+        for widget in (self.btn_open, self.btn_prev, self.btn_back,
+                       self.btn_play, self.btn_fwd, self.btn_next):
+            buttons_row.addWidget(widget)
+        buttons_row.addStretch(1)
+        buttons_row.addWidget(QLabel("Vol"))
+        buttons_row.addWidget(self.volume)
+        for widget in (self.btn_speed, self.btn_audio, self.btn_sub, self.btn_shot,
+                       self.btn_more, self.btn_list, self.btn_full):
+            buttons_row.addWidget(widget)
 
         self.controls_bar = QWidget()
-        self.controls_bar.setLayout(controls)
+        controls = QVBoxLayout(self.controls_bar)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(8)
+        controls.addLayout(seek_row)
+        controls.addLayout(buttons_row)
 
-        # ---------- Panel playlist (kanan) ----------
+        "== Panel playlist =="
         self.playlist_widget = QListWidget()
         self.playlist_widget.itemDoubleClicked.connect(
             lambda item: self.play_index(self.playlist_widget.row(item))
@@ -210,7 +382,7 @@ class Player(QMainWindow):
         side.addLayout(side_buttons)
         self.side_panel.setFixedWidth(260)
 
-        # ---------- Susunan utama ----------
+        "== Susunan utama =="
         left = QVBoxLayout()
         left.setSpacing(10)
         left.addWidget(self.video, stretch=1)
@@ -219,14 +391,14 @@ class Player(QMainWindow):
         main_layout = QHBoxLayout()
         main_layout.addLayout(left, stretch=1)
         main_layout.addWidget(self.side_panel)
-
-        central = QWidget()
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(12)
+
+        central = QWidget()
         central.setLayout(main_layout)
         self.setCentralWidget(central)
 
-        # ---------- Bar kontrol fullscreen (jendela terpisah, selalu di atas) ----------
+        "== Bar kontrol fullscreen =="
         self.fs_bar = QFrame()
         self.fs_bar.setObjectName("fsbar")
         self.fs_bar.setWindowFlags(
@@ -242,17 +414,21 @@ class Player(QMainWindow):
         self.fs_play = QPushButton("▶")
         self.fs_fwd = QPushButton(f"{SKIP_SECONDS}s »")
         self.fs_next = QPushButton("⏭")
+        self.fs_speed = QPushButton("1x")
+        self.fs_shot = QPushButton("📷")
         self.fs_exit = QPushButton("✕ Exit")
         self.fs_play.setObjectName("primary")
-        for b in (self.fs_prev, self.fs_back, self.fs_play,
-                  self.fs_fwd, self.fs_next, self.fs_exit):
-            b.setFocusPolicy(Qt.NoFocus)
+        for button in (self.fs_prev, self.fs_back, self.fs_play, self.fs_fwd,
+                       self.fs_next, self.fs_speed, self.fs_shot, self.fs_exit):
+            button.setFocusPolicy(Qt.NoFocus)
 
         self.fs_prev.clicked.connect(self.play_prev)
         self.fs_back.clicked.connect(lambda: self.skip(-SKIP_SECONDS))
         self.fs_play.clicked.connect(self.toggle_pause)
         self.fs_fwd.clicked.connect(lambda: self.skip(SKIP_SECONDS))
         self.fs_next.clicked.connect(self.play_next)
+        self.fs_speed.clicked.connect(self.cycle_speed)
+        self.fs_shot.clicked.connect(self.take_screenshot)
         self.fs_exit.clicked.connect(self.exit_fullscreen)
 
         self.fs_seek = QSlider(Qt.Horizontal)
@@ -269,49 +445,58 @@ class Player(QMainWindow):
         fs_layout = QHBoxLayout(self.fs_bar)
         fs_layout.setContentsMargins(14, 10, 14, 10)
         fs_layout.setSpacing(8)
-        fs_layout.addWidget(self.fs_prev)
-        fs_layout.addWidget(self.fs_back)
-        fs_layout.addWidget(self.fs_play)
-        fs_layout.addWidget(self.fs_fwd)
-        fs_layout.addWidget(self.fs_next)
+        for widget in (self.fs_prev, self.fs_back, self.fs_play, self.fs_fwd,
+                       self.fs_next, self.fs_speed, self.fs_shot):
+            fs_layout.addWidget(widget)
         fs_layout.addWidget(self.fs_seek, stretch=1)
         fs_layout.addWidget(self.fs_time)
         fs_layout.addWidget(QLabel("Vol"))
         fs_layout.addWidget(self.fs_volume)
         fs_layout.addWidget(self.fs_exit)
 
-        # ---------- Mesin mpv ----------
+        "== Mesin mpv =="
         self.player = mpv.MPV(
             wid=str(int(self.video.winId())),
             input_default_bindings=True,
             input_vo_keyboard=True,
-            sub_auto="fuzzy",   # subtitle otomatis kalau namanya mirip video
-            idle=True,          # mpv tetap hidup pas video selesai
+            sub_auto="fuzzy",
+            idle=True,
+            screenshot_format="png",
         )
         self.player.volume = self.volume.value()
 
-        # Tombol keyboard F, Esc, dan double click
+        "== Shortcut keyboard dari mpv =="
         self.fullscreen_toggled.connect(self.toggle_fullscreen)
         self.fullscreen_exited.connect(self.exit_fullscreen)
+        self.speed_up_req.connect(self.speed_up)
+        self.speed_down_req.connect(self.speed_down)
+        self.shot_req.connect(self.take_screenshot)
         self.player.register_key_binding("f", self._on_key_f)
         self.player.register_key_binding("ESC", self._on_key_esc)
         self.player.register_key_binding("MBTN_LEFT_DBL", self._on_key_f)
+        self.player.register_key_binding("]", self._on_key_speed_up)
+        self.player.register_key_binding("[", self._on_key_speed_down)
+        self.player.register_key_binding("s", self._on_key_shot)
 
-        # Timer buat ngecek gerakan kursor tiap 0.1 detik (munculin/sembunyiin bar fullscreen)
+        "== Server satu instance =="
+        if self.server is not None:
+            self.server.newConnection.connect(self.on_remote_connection)
+
+        "== Timer kursor =="
         self.cursor_timer = QTimer(self)
         self.cursor_timer.timeout.connect(self.check_cursor)
         self.cursor_timer.start(100)
 
-        # ---------- Discord Rich Presence ----------
+        "== Discord Rich Presence =="
         self.rpc = DiscordRPC()
         self.rpc.connect()
 
-        # ---------- Timer utama ----------
+        "== Timer utama =="
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(500)
 
-    # ================= Resume =================
+    "== Resume =="
     def load_resume(self):
         try:
             with open(RESUME_FILE, "r", encoding="utf-8") as f:
@@ -327,21 +512,77 @@ class Player(QMainWindow):
             print("Gagal simpan resume:", e)
 
     def remember_position(self):
-        """Catat posisi video yang lagi diputar."""
         if not self.current_path:
             return
         pos = self.player.time_pos
         dur = self.player.duration
         if pos is None or not dur:
             return
-        # Terlalu awal atau hampir habis: gak usah diingat
         if pos < 10 or pos > dur - 10:
             self.resume.pop(self.current_path, None)
         else:
             self.resume[self.current_path] = int(pos)
         self.save_resume_file()
 
-    # ================= Playlist =================
+    "== Open with dan satu instance =="
+    def open_initial(self, paths):
+        self.last_remote = time.time()
+        QTimer.singleShot(300, lambda: self.add_files(paths, replace=True))
+
+    def on_remote_connection(self):
+        conn = self.server.nextPendingConnection()
+        if conn is None:
+            return
+        conn.disconnected.connect(conn.deleteLater)
+        conn.waitForReadyRead(500)
+        raw = bytes(conn.readAll()).decode("utf-8", errors="ignore")
+        conn.disconnectFromServer()
+        paths = [p for p in raw.split("\n") if p]
+        if not paths:
+            return
+        now = time.time()
+        replace = now - self.last_remote > 1.5
+        self.last_remote = now
+        self.add_files(sorted(paths), replace=replace)
+        self.bring_to_front()
+
+    def bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def register_open_with(self):
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self, APP_TITLE, "Fitur ini cuma jalan di versi .exe hasil build."
+            )
+            return
+        try:
+            registry_register(sys.executable)
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "Berhasil didaftarkan.\n\nKlik kanan video, pilih Open with, lalu "
+                "Choose another app, pilih anthrme-MOVIEPLAYER, dan centang "
+                "Always kalau mau dijadikan default.",
+            )
+        except Exception as e:
+            QMessageBox.warning(self, APP_TITLE, f"Gagal mendaftarkan: {e}")
+
+    def unregister_open_with(self):
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self, APP_TITLE, "Fitur ini cuma jalan di versi .exe hasil build."
+            )
+            return
+        try:
+            registry_unregister(sys.executable)
+            QMessageBox.information(self, APP_TITLE, "Sudah dihapus dari menu Open with.")
+        except Exception as e:
+            QMessageBox.warning(self, APP_TITLE, f"Gagal menghapus: {e}")
+
+    "== Playlist =="
     def add_files(self, paths, replace=False):
         paths = [p for p in paths if p.lower().endswith(VIDEO_EXT)]
         if not paths:
@@ -356,7 +597,6 @@ class Player(QMainWindow):
             self.playlist.append(p)
             self.playlist_widget.addItem(os.path.basename(p))
 
-        # Langsung putar kalau belum ada yang main (atau daftar diganti)
         if replace or self.current_path is None:
             self.play_index(first_new)
 
@@ -374,7 +614,7 @@ class Player(QMainWindow):
         if not (0 <= index < len(self.playlist)):
             return
 
-        self.remember_position()  # simpan posisi video sebelumnya
+        self.remember_position()
 
         path = self.playlist[index]
         self.index = index
@@ -383,7 +623,6 @@ class Player(QMainWindow):
         self.setWindowTitle(f"{self.current_title} - {APP_TITLE}")
         self.was_playing = False
 
-        # Lanjut dari posisi terakhir kalau ada
         start = self.resume.get(path)
         try:
             self.player["start"] = str(int(start)) if start else "none"
@@ -399,7 +638,6 @@ class Player(QMainWindow):
 
     def play_prev(self):
         pos = self.player.time_pos or 0
-        # Lewat 5 detik: ulang dari awal. Kalau belum: ke video sebelumnya
         if pos > 5 or self.index <= 0:
             if self.current_path:
                 self.player.seek(0, reference="absolute")
@@ -418,8 +656,7 @@ class Player(QMainWindow):
         self.setWindowTitle(APP_TITLE)
 
     def on_file_finished(self):
-        """Dipanggil pas video habis."""
-        self.resume.pop(self.current_path, None)  # udah tamat, hapus resume-nya
+        self.resume.pop(self.current_path, None)
         self.save_resume_file()
 
         if self.index + 1 < len(self.playlist):
@@ -434,7 +671,7 @@ class Player(QMainWindow):
             self.time_label.setText("00:00 / 00:00")
             self.fs_time.setText("00:00 / 00:00")
 
-    # ================= Keyboard dari mpv =================
+    "== Keyboard dari mpv =="
     def _on_key_f(self, state, name, char):
         if state[0] in ("d", "p"):
             self.fullscreen_toggled.emit()
@@ -443,7 +680,19 @@ class Player(QMainWindow):
         if state[0] in ("d", "p"):
             self.fullscreen_exited.emit()
 
-    # ================= Drag & drop =================
+    def _on_key_speed_up(self, state, name, char):
+        if state[0] in ("d", "p"):
+            self.speed_up_req.emit()
+
+    def _on_key_speed_down(self, state, name, char):
+        if state[0] in ("d", "p"):
+            self.speed_down_req.emit()
+
+    def _on_key_shot(self, state, name, char):
+        if state[0] in ("d", "p"):
+            self.shot_req.emit()
+
+    "== Drag and drop =="
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -452,18 +701,16 @@ class Player(QMainWindow):
         paths = [url.toLocalFile() for url in event.mimeData().urls()]
         self.add_files(sorted(paths))
 
-    # ================= Kontrol =================
+    "== Kontrol dasar =="
     def toggle_pause(self):
         self.player.pause = not self.player.pause
 
     def skip(self, seconds):
-        """Maju (+) atau mundur (-) beberapa detik."""
         if self.current_path:
             self.player.seek(seconds, reference="relative")
 
     def on_volume(self, value):
         self.player.volume = value
-        # Samain slider volume di mode biasa dan di bar fullscreen
         for slider in (self.volume, self.fs_volume):
             if slider.value() != value:
                 slider.blockSignals(True)
@@ -476,7 +723,103 @@ class Player(QMainWindow):
             target = slider.value() / 1000 * duration
             self.player.seek(target, reference="absolute")
 
-    # ================= Panel & fullscreen =================
+    "== Kecepatan putar =="
+    def apply_speed(self, index):
+        index = max(0, min(len(SPEEDS) - 1, index))
+        self.speed_index = index
+        value = SPEEDS[index]
+        self.player.speed = value
+        text = f"{value:g}x"
+        self.btn_speed.setText(text)
+        self.fs_speed.setText(text)
+        self.show_toast(f"Kecepatan {text}")
+
+    def cycle_speed(self):
+        self.apply_speed((self.speed_index + 1) % len(SPEEDS))
+
+    def speed_up(self):
+        self.apply_speed(self.speed_index + 1)
+
+    def speed_down(self):
+        self.apply_speed(self.speed_index - 1)
+
+    "== Screenshot =="
+    def take_screenshot(self):
+        if not self.current_path:
+            self.show_toast("Belum ada video")
+            return
+        try:
+            os.makedirs(SHOT_DIR, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            name = re.sub(r'[\\/:*?"<>|]', "_", f"{self.current_title}_{stamp}.png")
+            path = os.path.join(SHOT_DIR, name)
+            self.player.screenshot_to_file(path, includes="subtitles")
+            self.show_toast("Screenshot tersimpan")
+        except Exception as e:
+            self.show_toast("Screenshot gagal")
+            print("Screenshot gagal:", e)
+
+    def open_shot_folder(self):
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        os.startfile(SHOT_DIR)
+
+    "== Audio dan subtitle =="
+    def fill_audio_menu(self):
+        self.fill_track_menu(self.audio_menu, "audio", "aid")
+
+    def fill_sub_menu(self):
+        self.fill_track_menu(self.sub_menu, "sub", "sid")
+        self.sub_menu.addSeparator()
+        load_action = self.sub_menu.addAction("Muat subtitle dari file...")
+        load_action.triggered.connect(self.load_subtitle_file)
+
+    def fill_track_menu(self, menu, kind, prop):
+        menu.clear()
+        try:
+            all_tracks = self.player.track_list or []
+        except Exception:
+            all_tracks = []
+        tracks = [t for t in all_tracks if t.get("type") == kind]
+
+        off_action = menu.addAction("Mati")
+        off_action.setCheckable(True)
+        off_action.setChecked(not any(t.get("selected") for t in tracks))
+        off_action.triggered.connect(
+            lambda checked=False, p=prop: setattr(self.player, p, "no")
+        )
+
+        for track in tracks:
+            action = menu.addAction(track_label(track))
+            action.setCheckable(True)
+            action.setChecked(bool(track.get("selected")))
+            action.triggered.connect(
+                lambda checked=False, p=prop, tid=track["id"]: setattr(self.player, p, tid)
+            )
+
+    def load_subtitle_file(self):
+        if not self.current_path:
+            self.show_toast("Belum ada video")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Pilih subtitle",
+            "",
+            "Subtitle (*.srt *.ass *.ssa *.vtt *.sub);;Semua file (*.*)",
+        )
+        if path:
+            try:
+                self.player.command("sub-add", path)
+                self.show_toast("Subtitle dimuat")
+            except Exception as e:
+                self.show_toast("Subtitle gagal dimuat")
+                print("Subtitle gagal:", e)
+
+    "== Notifikasi =="
+    def show_toast(self, text):
+        area = self.screen().geometry() if self.isFullScreen() else self.geometry()
+        self.toast.popup(text, area)
+
+    "== Panel dan fullscreen =="
     def toggle_panel(self):
         self.panel_visible = not self.panel_visible
         self.side_panel.setVisible(self.panel_visible)
@@ -488,7 +831,6 @@ class Player(QMainWindow):
             self.controls_bar.hide()
             self.side_panel.hide()
             self.showFullScreen()
-            # Tampilkan bar sebentar pas baru masuk fullscreen
             self.last_cursor_pos = QCursor.pos()
             self.last_cursor_move = time.time()
             self.show_fs_bar()
@@ -501,9 +843,8 @@ class Player(QMainWindow):
             self.side_panel.setVisible(self.panel_visible)
 
     def show_fs_bar(self):
-        """Munculin bar kontrol di bawah tengah layar."""
         geo = self.screen().geometry()
-        width = min(geo.width() - 80, 1150)
+        width = min(geo.width() - 80, 1250)
         self.fs_bar.setFixedWidth(width)
         self.fs_bar.adjustSize()
         x = geo.left() + (geo.width() - width) // 2
@@ -513,7 +854,6 @@ class Player(QMainWindow):
         self.fs_bar.raise_()
 
     def check_cursor(self):
-        """Munculin bar pas mouse gerak, sembunyiin pas mouse diem (cuma di fullscreen)."""
         if not self.isFullScreen():
             if self.fs_bar.isVisible():
                 self.fs_bar.hide()
@@ -533,12 +873,11 @@ class Player(QMainWindow):
             if now - self.last_cursor_move > BAR_HIDE_DELAY and not over_bar and not busy:
                 self.fs_bar.hide()
 
-    # ================= Update UI & Discord =================
+    "== Update UI dan Discord =="
     def update_ui(self):
         pos = self.player.time_pos
         dur = self.player.duration
 
-        # Deteksi video selesai -> lanjut ke berikutnya
         if pos is not None:
             self.was_playing = True
         elif self.current_path and self.was_playing and self.player.idle_active:
@@ -560,29 +899,29 @@ class Player(QMainWindow):
         self.btn_play.setText(icon)
         self.fs_play.setText(icon)
 
-        # Simpan posisi tiap 5 detik
         if pos is not None and time.time() - self.last_save > 5:
             self.last_save = time.time()
             self.remember_position()
 
-        # Kirim status ke Discord
         if self.current_title and pos is not None:
             self.rpc.update(self.current_title, bool(self.player.pause), pos, dur)
         else:
             self.rpc.clear()
 
     def closeEvent(self, event):
+        self.toast.close()
         self.fs_bar.close()
         self.cursor_timer.stop()
         self.timer.stop()
         self.remember_position()
         self.rpc.close()
+        if self.server is not None:
+            self.server.close()
         self.player.terminate()
         event.accept()
 
 
 if __name__ == "__main__":
-    # Biar icon di taskbar Windows pakai icon app lu, bukan icon Python
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
@@ -591,11 +930,22 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    paths = sorted(os.path.abspath(a) for a in sys.argv[1:] if os.path.isfile(a))
+
     app = QApplication(sys.argv)
+    if paths and forward_to_running_instance(paths):
+        sys.exit(0)
+
     app.setStyleSheet(THEME)
     app.setWindowIcon(QIcon(ICON_PATH))
     locale.setlocale(locale.LC_NUMERIC, "C")
 
-    window = Player()
+    server = QLocalServer()
+    QLocalServer.removeServer(SERVER_NAME)
+    server.listen(SERVER_NAME)
+
+    window = Player(server)
     window.show()
+    if paths:
+        window.open_initial(paths)
     sys.exit(app.exec())
