@@ -17,6 +17,8 @@ A lightweight desktop video player built with Python, powered by mpv, with live 
 - Automatic subtitle loading (`.srt` with the same name as the video)
 - Discord Rich Presence: title, progress, and play/pause status
 - Custom dark theme
+- Playback speed (0.5x to 2x), screenshots, audio track and subtitle selection
+- "Open with" support: open videos straight from Windows Explorer
 
 ## Download (Windows)
 
