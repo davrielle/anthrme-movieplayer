@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+build/
+dist/
+*.spec
+*.pyc
+resume.json
+ID&PRIVATEKEY.txt
+mpv-2.dll
+.vscode/
